@@ -1,194 +1,157 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+import streamlit as st
+import pandas as pd
+import numpy as np
+import time
+from datetime import datetime
+import os
+from xgboost import XGBClassifier
+from sklearn.model_selection import train_test_split
 
-# C extensions
-*.so
+# Page configuration
+st.set_page_config(page_title="TopstepX AI Signals", layout="centered")
+st.title("📈 TopstepX AI Trade Signal Assistant")
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# Configuration constants
+CSV_FILE = "/storage/emulated/0/Download/Sample_Intraday.csv"  # Path to cleaned or raw CSV
+LOG_FILE = "trade_log.csv"
+MAX_CONTRACTS = 3
+TRADING_END_HOUR = 21  # UTC
+MIN_CONFIDENCE = 60
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# === Feature Engineering ===
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+def add_features(df):
+    df['ema_fast'] = df['close'].ewm(span=10).mean()
+    df['ema_slow'] = df['close'].ewm(span=21).mean()
+    df['rsi'] = compute_rsi(df['close'])
+    df['macd'] = df['ema_fast'] - df['ema_slow']
+    df['price_diff'] = df['close'].diff()
+    df['volume_change'] = df['volume'].pct_change()
+    df.dropna(inplace=True)
+    return df
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-cover/
+def generate_labels(df):
+    df['label'] = 0
+    df.loc[(df['ema_fast'] > df['ema_slow']) & (df['rsi'] < 70), 'label'] = 1
+    df.loc[(df['ema_fast'] < df['ema_slow']) & (df['rsi'] > 30), 'label'] = -1
+    return df
 
-# Translations
-*.mo
-*.pot
+def prepare_ml_data(df):
+    features = ['ema_fast', 'ema_slow', 'rsi', 'macd', 'price_diff', 'volume_change']
+    X = df[features]
+    y = df['label']
+    return X, y
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+def train_model(X, y):
+    model = XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', verbosity=0)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+    model.fit(X_train, y_train)
+    return model
 
-# Flask stuff:
-instance/
-.webassets-cache
+def predict_signals(model, df):
+    features = ['ema_fast', 'ema_slow', 'rsi', 'macd', 'price_diff', 'volume_change']
+    X = df[features]
+    preds = model.predict(X)
+    probs = model.predict_proba(X).max(axis=1)
+    df['signal'] = preds
+    df['confidence'] = probs * 100
+    df['signal_str'] = df['signal'].map({1: 'BUY', -1: 'SELL', 0: 'HOLD'})
+    return df
 
-# Scrapy stuff:
-.scrapy
+# === Caching Functions ===
+@st.cache_data(ttl=60)
+def load_data():
+    try:
+        if os.path.exists(LOG_FILE):
+            return pd.read_csv(LOG_FILE, parse_dates=['timestamp'])
+        else:
+            return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Error loading log: {e}")
+        return pd.DataFrame()
 
-# Sphinx documentation
-docs/_build/
+@st.cache_data(ttl=60)
+def is_trade_time():
+    now = datetime.utcnow()
+    return now.hour < TRADING_END_HOUR
 
-# PyBuilder
-.pybuilder/
-target/
+# === Main Execution ===
+try:
+    if not os.path.exists(CSV_FILE):
+        st.error(f"Data file not found: {CSV_FILE}")
+        st.info("Upload or place the CSV with columns: Time, Last, Volume")
+    else:
+        df = pd.read_csv(CSV_FILE)
 
-# Jupyter Notebook
-.ipynb_checkpoints
+        # === Fix column names and format ===
+        df.rename(columns={'Time': 'datetime', 'Last': 'close', 'Volume': 'volume'}, inplace=True)
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df.set_index('datetime', inplace=True)
 
-# IPython
-profile_default/
-ipython_config.py
+        # === Feature & Signal Engineering ===
+        df = add_features(df)
+        df = generate_labels(df)
+        X, y = prepare_ml_data(df)
+        model = train_model(X, y)
+        df = predict_signals(model, df)
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+        # === Save to log ===
+        if not os.path.exists(LOG_FILE):
+            with open(LOG_FILE, 'w') as f:
+                f.write("timestamp,signal,confidence,price\n")
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+        latest_rows = df.tail(10)
+        with open(LOG_FILE, 'w') as f:
+            f.write("timestamp,signal,confidence,price\n")
+            for idx, row in latest_rows.iterrows():
+                f.write(f"{idx},{row['signal_str']},{row['confidence']:.2f},{row['close']:.2f}\n")
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
+        # === Dashboard Display ===
+        df_log = load_data()
+        if df_log.empty:
+            st.warning("No signals generated yet...")
+        else:
+            latest = df_log.iloc[-1]
+            valid_time = is_trade_time()
+            is_confident = latest['confidence'] >= MIN_CONFIDENCE
+            status = "✅ VALID TRADE" if valid_time and is_confident else "⛔ BLOCKED"
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
+            st.metric(
+                label=f"📍 Latest Signal — {status}",
+                value=latest['signal'].upper(),
+                delta=f"{latest['confidence']:.2f}% Confidence"
+            )
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#pdm.lock
-#   pdm stores project-wide configurations in .pdm.toml, but it is recommended to not include it
-#   in version control.
-#   https://pdm.fming.dev/latest/usage/project/#working-with-version-control
-.pdm.toml
-.pdm-python
-.pdm-build/
+            if not valid_time:
+                st.error("🚫 Outside trading hours")
+            if not is_confident:
+                st.warning(f"⚠️ Below confidence threshold ({MIN_CONFIDENCE}%)")
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+            st.write("## 🕓 Recent Signal History")
+            st.dataframe(
+                df_log.tail(20).sort_values(by="timestamp", ascending=False),
+                use_container_width=True
+            )
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+            st.write("## 📊 Signal Confidence Distribution")
+            st.bar_chart(df_log['confidence'])
 
-# SageMath parsed files
-*.sage.py
+            st.write("## 📈 Signal Count Summary")
+            st.dataframe(df_log['signal'].value_counts().rename_axis('signal').reset_index(name='count'))
 
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
-
-# Abstra
-# Abstra is an AI-powered process automation framework.
-# Ignore directories containing user credentials, local state, and settings.
-# Learn more at https://abstra.io/docs
-.abstra/
-
-# Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#  you could uncomment the following to ignore the enitre vscode folder
-# .vscode/
-
-# Ruff stuff:
-.ruff_cache/
-
-# PyPI configuration file
-.pypirc
-
-# Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
-.cursorignore
-.cursorindexingignore
+except FileNotFoundError:
+    st.error("CSV not found. Please upload the file.")
+except KeyError as e:
+    st.error(f"Missing required column: {e}")
+    st.info("Expected columns: Time, Last, Volume")
+except Exception as e:
+    st.error(f"Unexpected error: {e}")
+    st.info("Check file format and data quality.")
